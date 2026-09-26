@@ -48,6 +48,21 @@ hr.divider{border:none;border-top:1px dashed var(--line);margin:20px 0}
 .overlay img{max-width:100%;max-height:100%}
 .toast{position:fixed;left:50%;bottom:calc(100px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#333;color:#fff;padding:10px 18px;border-radius:20px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:60}
 .toast.show{opacity:1}
+.unf{color:var(--hard);font-weight:600}
+.tabs{display:flex;gap:6px;margin-top:14px}
+.tab{padding:7px 12px;font-size:14px;border-radius:999px;background:transparent;border:1px solid var(--line)}
+.tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.card-row{display:flex;gap:12px;align-items:center}
+.card-body{flex:1;min-width:0}
+.thumb{width:56px;height:56px;object-fit:cover;border-radius:8px;background:var(--line);flex-shrink:0}
+.mode{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
+.mode input{margin-top:4px;accent-color:var(--accent)}
+.mode.on{border-color:var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;margin-top:8px}
+.cell{position:relative;aspect-ratio:1;border-radius:8px;overflow:hidden;background:var(--line)}
+.cell img{width:100%;height:100%;object-fit:cover;display:block}
+.badge{position:absolute;left:4px;top:4px;background:rgba(0,0,0,.65);color:#fff;font-size:12px;padding:2px 6px;border-radius:6px}
+.x{position:absolute;right:4px;top:4px;width:28px;height:28px;padding:0;border-radius:50%;background:rgba(0,0,0,.65);color:#fff;font-size:16px;line-height:28px}
 </style>
 </head>
 <body>
@@ -65,11 +80,12 @@ let db;
 function openDB(){
   return new Promise((res,rej)=>{
     const r=indexedDB.open('anki-cards',1);
+    // 将来バージョンを上げても既存データを壊さないよう、無いものだけ作る
     r.onupgradeneeded=()=>{
       const d=r.result;
-      d.createObjectStore('decks',{keyPath:'id'});
-      d.createObjectStore('cards',{keyPath:'id'}).createIndex('deckId','deckId');
-      d.createObjectStore('images',{keyPath:'id'}); // 画像は別ストア（カード一覧を軽くするため）
+      if(!d.objectStoreNames.contains('decks'))d.createObjectStore('decks',{keyPath:'id'});
+      if(!d.objectStoreNames.contains('cards'))d.createObjectStore('cards',{keyPath:'id'}).createIndex('deckId','deckId');
+      if(!d.objectStoreNames.contains('images'))d.createObjectStore('images',{keyPath:'id'}); // 画像は別ストア（カード一覧を軽くするため）
     };
     r.onsuccess=()=>res(r.result);
     r.onerror=()=>rej(r.error);
@@ -100,6 +116,14 @@ const put=(s,v)=>tx(s,'readwrite',o=>o.put(v));
 const cardsOf=deckId=>tx('cards','readonly',o=>o.index('deckId').getAll(deckId));
 const getImg=async id=>id?((await get('images',id))?.data??null):null;
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+// 裏（答え）が空のカードは「未完成」。学習には出さず、あとで答えを埋める
+const isUnfinished=c=>!(c.back||'').trim()&&!c.backImg;
+const isDue=(c,now=Date.now())=>!isUnfinished(c)&&c.due<=now;
+function newCard(deckId,extra={}){
+  const now=Date.now();
+  return {id:uid(),deckId,created:now,due:now,interval:0,ease:2.5,reps:0,lapses:0,lastReview:null,
+    front:'',back:'',frontImg:null,backImg:null,...extra};
+}
 
 // ===== 出題スケジュール（SM-2ベース） =====
 const DAY=86400000;
@@ -210,10 +234,11 @@ async function renderHome(){
   const now=Date.now();
   const list=h('div',{class:'list'},decks.map(d=>{
     const cs=cards.filter(c=>c.deckId===d.id);
-    const due=cs.filter(c=>c.due<=now).length;
+    const due=cs.filter(c=>isDue(c,now)).length;
+    const unf=cs.filter(isUnfinished).length;
     return h('div',{class:'item'},
       h('div',{class:'deck-name',onclick:()=>renderDeck(d.id)},d.name),
-      h('div',{class:'count'},'今日 ',h('b',{},due),` 枚 / 全 ${cs.length} 枚`),
+      h('div',{class:'count'},'今日 ',h('b',{},due),` 枚 / 全 ${cs.length} 枚`,unf?h('span',{class:'unf'},`　未完成 ${unf}`):null),
       h('div',{class:'row',style:'margin-top:10px'},
         h('button',{class:'primary',disabled:due===0,onclick:()=>renderStudy(d.id)},'学習する'),
         h('button',{onclick:()=>renderEditor(d.id)},'＋ 追加'),
@@ -231,34 +256,63 @@ async function newDeck(){
 }
 
 // ===== デッキ詳細（カード一覧） =====
-async function renderDeck(deckId){
+async function renderDeck(deckId,filter='all'){
   const deck=await get('decks',deckId);
   if(!deck)return renderHome();
   setHeader(deck.name,renderHome);
   const cards=(await cardsOf(deckId)).sort((a,b)=>b.created-a.created);
-  const due=cards.filter(c=>c.due<=Date.now()).length;
+  const due=cards.filter(c=>isDue(c)).length;
+  const unfCount=cards.filter(isUnfinished).length;
+  if(filter==='unf'&&!unfCount)filter='all';
   const search=h('input',{type:'search',placeholder:'カードを検索'});
   const listEl=h('div',{class:'list'});
+  const tabs=h('div',{class:'tabs'});
+  const drawTabs=()=>tabs.replaceChildren(
+    h('button',{class:filter==='all'?'tab on':'tab',onclick:()=>{filter='all';drawTabs();draw();}},`すべて（${cards.length}）`),
+    h('button',{class:filter==='unf'?'tab on':'tab',disabled:!unfCount,onclick:()=>{filter='unf';drawTabs();draw();}},`未完成（${unfCount}）`));
   const draw=()=>{
     const q=search.value.trim().toLowerCase();
-    const f=cards.filter(c=>!q||(c.front+'\n'+c.back).toLowerCase().includes(q));
-    listEl.replaceChildren(...(f.length?f.map(c=>h('div',{class:'item',onclick:()=>renderEditor(deckId,c.id)},
-      h('div',{class:'clip'},firstLine(c.front)||'（画像のみ）',(c.frontImg||c.backImg)?' 🖼':''),
-      h('div',{class:'meta clip'},firstLine(c.back)),
-      h('div',{class:'meta'},c.lastReview==null?'新規':`次回 ${fmtDate(c.due)}（間隔 ${fmtIv(c.interval)}）`)))
+    // 未完成タブは作った順（古い順）に並べて、上から埋めていけるようにする
+    const base=filter==='unf'?cards.filter(isUnfinished).reverse():cards;
+    const f=base.filter(c=>!q||(c.front+'\n'+c.back).toLowerCase().includes(q));
+    listEl.replaceChildren(...(f.length?f.map(c=>h('div',{class:'item card-row',onclick:()=>renderEditor(deckId,c.id,{fromUnfinished:filter==='unf'})},
+      c.frontImg?h('img',{class:'thumb','data-img':c.frontImg,alt:''}):null,
+      h('div',{class:'card-body'},
+        h('div',{class:'clip'},firstLine(c.front)||'（画像のみ）',c.backImg?' 🖼':''),
+        h('div',{class:'meta clip'},isUnfinished(c)?h('span',{class:'unf'},'未完成（答えが空）'):firstLine(c.back)||'（画像）'),
+        isUnfinished(c)?null:h('div',{class:'meta'},c.lastReview==null?'新規':`次回 ${fmtDate(c.due)}（間隔 ${fmtIv(c.interval)}）`))))
       :[h('div',{class:'empty'},cards.length?'該当なし':'カードがありません')]));
+    loadThumbs(listEl);
   };
   search.addEventListener('input',draw);
   show(
     h('div',{class:'row'},
       h('button',{class:'primary',disabled:due===0,onclick:()=>renderStudy(deckId)},`学習する（${due}）`),
-      h('button',{onclick:()=>renderEditor(deckId)},'＋ カード追加')),
-    h('div',{style:'margin:14px 0'},search),
+      h('button',{onclick:()=>renderEditor(deckId)},'＋ カード追加'),
+      h('button',{onclick:()=>renderBulk(deckId)},'📷 まとめて追加')),
+    unfCount?h('p',{class:'meta'},'未完成のカードは学習に出ません。答えを入れると出るようになります。'):null,
+    tabs,
+    h('div',{style:'margin:10px 0 14px'},search),
     listEl,
     h('div',{class:'row',style:'margin-top:28px'},
       h('button',{onclick:()=>renameDeck(deck)},'名前を変更'),
       h('button',{class:'danger',onclick:()=>deleteDeck(deck,cards)},'デッキを削除')));
-  draw();
+  drawTabs();draw();
+}
+// 一覧のサムネイルは画面に近づいたものだけ読み込む（枚数が多くても重くならないように）
+const thumbObserver='IntersectionObserver' in window?new IntersectionObserver(async entries=>{
+  for(const e of entries){
+    if(!e.isIntersecting)continue;
+    thumbObserver.unobserve(e.target);
+    const src=await getImg(e.target.dataset.img);
+    if(src)e.target.src=src;
+  }
+},{rootMargin:'300px'}):null;
+function loadThumbs(root){
+  root.querySelectorAll('img[data-img]').forEach(async img=>{
+    if(thumbObserver)thumbObserver.observe(img);
+    else{const src=await getImg(img.dataset.img);if(src)img.src=src;}
+  });
 }
 async function renameDeck(deck){
   const name=prompt('新しい名前',deck.name);
@@ -309,10 +363,11 @@ function makeSide(label,text,img){
     reset(){ta.value='';cur=null;changed=false;draw();}
   };
 }
-async function renderEditor(deckId,cardId){
+async function renderEditor(deckId,cardId,opts={}){
   const deck=await get('decks',deckId);
   const card=cardId?await get('cards',cardId):null;
-  setHeader(card?'カードを編集':`${deck.name} に追加`,()=>renderDeck(deckId));
+  const backTo=()=>renderDeck(deckId,opts.fromUnfinished?'unf':'all');
+  setHeader(card?'カードを編集':`${deck.name} に追加`,backTo);
   const [fi,bi]=await Promise.all([getImg(card?.frontImg),getImg(card?.backImg)]);
   const front=makeSide('表（問題）',card?.front||'',fi);
   const back=makeSide('裏（答え）',card?.back||'',bi);
@@ -320,8 +375,8 @@ async function renderEditor(deckId,cardId){
   async function save(){
     const f=front.value(),b=back.value();
     if(!f.text.trim()&&!f.img){toast('表が空です');return false;}
-    const now=Date.now();
-    const c=card?{...card}:{id:uid(),deckId,created:now,due:now,interval:0,ease:2.5,reps:0,lapses:0,lastReview:null,frontImg:null,backImg:null};
+    const c=card?{...card}:newCard(deckId);
+    const wasUnfinished=card&&isUnfinished(card);
     c.front=f.text;c.back=b.text;
     await txMulti(['cards','images'],s=>{
       for(const [side,key] of [[f,'frontImg'],[b,'backImg']]){
@@ -329,14 +384,32 @@ async function renderEditor(deckId,cardId){
         if(c[key]){s.images.delete(c[key]);c[key]=null;}
         if(side.img){const id=uid();s.images.put({id,data:side.img});c[key]=id;}
       }
+      // 未完成だったカードに答えが入ったら、今日から学習に出す
+      if(wasUnfinished&&!isUnfinished(c))c.due=Math.min(c.due,Date.now());
       s.cards.put(c);
     });
     return true;
   }
+  // 次の未完成カード（作った順）
+  async function nextUnfinished(){
+    const cs=(await cardsOf(deckId)).filter(isUnfinished).sort((a,b)=>a.created-b.created);
+    return cs.find(x=>x.id!==card.id)||null;
+  }
+
+  // 未完成カードを開いたときは、答えの欄にすぐ入力できるようにする
+  if(card&&isUnfinished(card))setTimeout(()=>back.ta.focus({preventScroll:true}),50);
 
   const buttons=card
     ?h('div',{class:'row',style:'margin-top:20px'},
-      h('button',{class:'primary',onclick:async()=>{if(await save()){toast('保存しました');renderDeck(deckId);}}},'保存'),
+      opts.fromUnfinished
+        ?h('button',{class:'primary',onclick:async()=>{
+          if(!await save())return;
+          const n=await nextUnfinished();
+          if(n){toast('保存しました');renderEditor(deckId,n.id,opts);}
+          else{toast('未完成のカードはもうありません');renderDeck(deckId);}
+        }},'保存して次の未完成へ')
+        :h('button',{class:'primary',onclick:async()=>{if(await save()){toast('保存しました');backTo();}}},'保存'),
+      opts.fromUnfinished?h('button',{onclick:async()=>{if(await save()){toast('保存しました');backTo();}}},'保存して戻る'):null,
       h('button',{class:'danger',onclick:async()=>{
         if(!confirm('このカードを削除しますか？'))return;
         await txMulti(['cards','images'],s=>{
@@ -344,7 +417,7 @@ async function renderEditor(deckId,cardId){
           if(card.backImg)s.images.delete(card.backImg);
           s.cards.delete(card.id);
         });
-        toast('削除しました');renderDeck(deckId);
+        toast('削除しました');backTo();
       }},'削除'))
     :h('div',{class:'row',style:'margin-top:20px'},
       h('button',{class:'primary',onclick:async()=>{
@@ -354,11 +427,93 @@ async function renderEditor(deckId,cardId){
   show(front.el,back.el,buttons);
 }
 
+// ===== まとめて追加 =====
+const BULK_MODES=[
+  {key:'front',label:'1枚＝1カード',desc:'画像を表（問題）に入れます。答えはあとで「未完成」から入力します。'},
+  {key:'pair',label:'2枚で1カード',desc:'選んだ順に2枚ずつ組にして、1枚目を表、2枚目を裏にします。'},
+];
+async function renderBulk(deckId){
+  const deck=await get('decks',deckId);
+  setHeader('まとめて追加',()=>renderDeck(deckId));
+  let items=[]; // {file,url}
+  let mode='front';
+  try{mode=localStorage.getItem('bulkMode')||'front';}catch{}
+  if(!BULK_MODES.some(m=>m.key===mode))mode='front';
+
+  const file=h('input',{type:'file',accept:'image/*',multiple:true,style:'display:none'});
+  const modeEl=h('div',{class:'list'});
+  const grid=h('div',{class:'grid'});
+  const info=h('p',{class:'meta'});
+  const saveBtn=h('button',{class:'primary',style:'width:100%;padding:14px'});
+
+  const drawMode=()=>modeEl.replaceChildren(...BULK_MODES.map(m=>
+    h('label',{class:m.key===mode?'item mode on':'item mode'},
+      h('input',{type:'radio',name:'bulkmode',checked:m.key===mode,onchange:()=>{
+        mode=m.key;try{localStorage.setItem('bulkMode',mode);}catch{}
+        drawMode();drawGrid();}}),
+      h('div',{},h('div',{style:'font-weight:600'},m.label),h('div',{class:'meta'},m.desc)))));
+
+  const cardCount=()=>mode==='pair'?Math.ceil(items.length/2):items.length;
+  const drawGrid=()=>{
+    grid.replaceChildren(...items.map((it,i)=>h('div',{class:'cell'},
+      h('img',{src:it.url,alt:''}),
+      mode==='pair'?h('span',{class:'badge'},`${Math.floor(i/2)+1}${i%2?' 裏':' 表'}`):h('span',{class:'badge'},i+1),
+      h('button',{class:'x',onclick:()=>{URL.revokeObjectURL(it.url);items.splice(i,1);drawGrid();}},'×'))));
+    const odd=mode==='pair'&&items.length%2===1;
+    info.textContent=!items.length?'写真を選ぶと、ここに並びます。×で外せます。'
+      :`${items.length}枚 → ${cardCount()}枚のカードを作ります`+(odd?'（最後の1枚は答えなし＝未完成になります）':'');
+    saveBtn.textContent=items.length?`${cardCount()}枚のカードを作る`:'カードを作る';
+    saveBtn.disabled=!items.length;
+  };
+  file.addEventListener('change',()=>{
+    for(const f of file.files)items.push({file:f,url:URL.createObjectURL(f)});
+    file.value='';drawGrid();
+  });
+
+  saveBtn.addEventListener('click',async()=>{
+    if(!items.length)return;
+    saveBtn.disabled=true;
+    const groups=mode==='pair'
+      ?Array.from({length:Math.ceil(items.length/2)},(_,i)=>[items[i*2],items[i*2+1]])
+      :items.map(it=>[it,null]);
+    let made=0,failed=0;
+    const base=Date.now();
+    for(const [f,b] of groups){
+      saveBtn.textContent=`作成中… ${made+failed+1} / ${groups.length}`;
+      try{
+        const fData=await resizeImage(f.file);
+        const bData=b?await resizeImage(b.file):null;
+        // createdを1msずつずらして、選んだ順番を保つ
+        const c=newCard(deckId,{created:base+made});
+        await txMulti(['cards','images'],s=>{
+          c.frontImg=uid()+'f';s.images.put({id:c.frontImg,data:fData});
+          if(bData){c.backImg=uid()+'b';s.images.put({id:c.backImg,data:bData});}
+          s.cards.put(c);
+        });
+        made++;
+      }catch(e){failed++;}
+    }
+    items.forEach(it=>URL.revokeObjectURL(it.url));
+    items=[];
+    toast(failed?`${made}枚作成（${failed}枚は失敗）`:`${made}枚のカードを作りました`);
+    renderDeck(deckId,mode==='front'?'unf':'all');
+  });
+
+  drawMode();drawGrid();
+  show(
+    h('p',{class:'meta',style:'margin-top:0'},`追加先: ${deck.name}`),
+    modeEl,
+    h('div',{style:'margin:16px 0 8px'},h('button',{style:'width:100%;padding:14px',onclick:()=>file.click()},'写真を選ぶ（複数OK）')),
+    file,info,grid,
+    h('div',{style:'height:90px'}),
+    h('div',{class:'bottombar'},saveBtn));
+}
+
 // ===== 学習 =====
 async function renderStudy(deckId){
   const deck=await get('decks',deckId);
   const now=Date.now();
-  const queue=(await cardsOf(deckId)).filter(c=>c.due<=now).sort((a,b)=>a.due-b.due);
+  const queue=(await cardsOf(deckId)).filter(c=>isDue(c,now)).sort((a,b)=>a.due-b.due);
   let done=0;
   const exit=()=>renderDeck(deckId);
 
